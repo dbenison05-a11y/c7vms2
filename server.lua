@@ -1,5 +1,7 @@
 local playerCooldowns = {}
 local playerSpawnCounts = {}
+local vehicleFleet = {}
+local vehicleOwnership = {}
 
 local function getPlayerIdentifiers(src)
     local ids = GetPlayerIdentifiers(src)
@@ -30,24 +32,41 @@ local function getPlayerDiscord(src)
     return nil
 end
 
-local function hasAceAccess(src, department)
-    if not department or not department.ace then
+local function saveVehicleState(plate, data)
+    local json = json.encode(data)
+    SetResourceKvp('c7vms2:vehicle:' .. plate, json)
+end
+
+local function loadVehicleState(plate)
+    local data = GetResourceKvpString('c7vms2:vehicle:' .. plate)
+    if not data or data == '' then
+        return nil
+    end
+    return json.decode(data)
+end
+
+local function deleteVehicleState(plate)
+    DeleteResourceKvp('c7vms2:vehicle:' .. plate)
+end
+
+local function hasAceAccess(src, ace)
+    if not ace then
         return true
     end
 
-    if Config.permissions.enableAce and IsPlayerAceAllowed(src, department.ace) then
+    if Config.permissions.enableAce and IsPlayerAceAllowed(src, ace) then
         return true
     end
 
     return false
 end
 
-local function hasDiscordAccess(src, department)
+local function hasDiscordAccess(src, discordRoles)
     if not Config.permissions.enableDiscord then
         return true
     end
 
-    local roleIds = department.discordRoles or {}
+    local roleIds = discordRoles or {}
     if not roleIds or #roleIds == 0 then
         return true
     end
@@ -69,30 +88,42 @@ local function hasDiscordAccess(src, department)
     return false
 end
 
-local function hasDepartmentAccess(src, departmentKey)
+local function hasDepartmentAccess(src, ace, discordRoles)
+    if Config.permissions.mode == 'ace' then
+        return hasAceAccess(src, ace)
+    end
+
+    if Config.permissions.mode == 'discord' then
+        return hasDiscordAccess(src, discordRoles)
+    end
+
+    if Config.permissions.enableAce and hasAceAccess(src, ace) then
+        return true
+    end
+
+    if Config.permissions.enableDiscord and hasDiscordAccess(src, discordRoles) then
+        return true
+    end
+
+    return true
+end
+
+local function isAdmin(src)
+    return IsPlayerAceAllowed(src, Config.adminPerms.superAdmin) or 
+           IsPlayerAceAllowed(src, Config.adminPerms.canDeleteVehicles)
+end
+
+local function isSupervisor(src, departmentKey)
+    if not departmentKey then
+        return false
+    end
+
     local department = Config.departments[departmentKey]
     if not department then
         return false
     end
 
-    if Config.permissions.mode == 'ace' then
-        return hasAceAccess(src, department)
-    end
-
-    if Config.permissions.mode == 'discord' then
-        return hasDiscordAccess(src, department)
-    end
-
-    -- hybrid mode: allow if either ace or discord passes
-    if Config.permissions.enableAce and hasAceAccess(src, department) then
-        return true
-    end
-
-    if Config.permissions.enableDiscord and hasDiscordAccess(src, department) then
-        return true
-    end
-
-    return true
+    return IsPlayerAceAllowed(src, department.supervisorAce or Config.adminPerms.departmentSupervisor)
 end
 
 local function getPlayerKey(src)
@@ -158,53 +189,112 @@ local function applyVehicleModifiers(vehicle, modifiers)
     end
 end
 
-local function getVehicleList()
+local function getVehicleListForPlayer(src)
     local result = {}
 
     for deptKey, department in pairs(Config.departments) do
-        local currentDept = {
-            id = deptKey,
-            label = department.label,
-            image = department.image,
-            vehicles = {}
-        }
+        local hasDeptAccess = hasDepartmentAccess(src, department.ace, department.discordRoles)
 
-        for _, vehicle in ipairs(department.vehicles) do
-            table.insert(currentDept.vehicles, {
-                id = vehicle.id,
-                label = vehicle.label,
-                model = vehicle.model,
-                image = vehicle.image,
-                spawnLimit = vehicle.spawnLimit or 0,
-                cooldown = vehicle.cooldown or 0,
-                livery = vehicle.livery or 0,
-                extras = vehicle.extras or {},
-                extrasOff = vehicle.extrasOff or {},
-                modifiers = vehicle.modifiers or {},
-                platePrefix = vehicle.platePrefix or 'VMS'
-            })
+        if hasDeptAccess then
+            local currentDept = {
+                id = deptKey,
+                label = department.label,
+                image = department.image,
+                subDepartments = {}
+            }
+
+            if department.subDepartments then
+                for subDeptKey, subDept in pairs(department.subDepartments) do
+                    local hasSubAccess = hasDepartmentAccess(src, subDept.ace, subDept.discordRoles or {})
+
+                    if hasSubAccess then
+                        local subDeptEntry = {
+                            id = subDeptKey,
+                            label = subDept.label,
+                            image = subDept.image,
+                            vehicles = {}
+                        }
+
+                        for _, vehicle in ipairs(subDept.vehicles or {}) do
+                            table.insert(subDeptEntry.vehicles, {
+                                id = vehicle.id,
+                                label = vehicle.label,
+                                model = vehicle.model,
+                                image = vehicle.image,
+                                spawnLimit = vehicle.spawnLimit or 0,
+                                cooldown = vehicle.cooldown or 0,
+                                livery = vehicle.livery or 0,
+                                extras = vehicle.extras or {},
+                                extrasOff = vehicle.extrasOff or {},
+                                modifiers = vehicle.modifiers or {},
+                                platePrefix = vehicle.platePrefix or 'VMS',
+                                maxInventorySlots = vehicle.maxInventorySlots or 4
+                            })
+                        end
+
+                        table.insert(currentDept.subDepartments, subDeptEntry)
+                    end
+                end
+            else
+                for _, vehicle in ipairs(department.vehicles or {}) do
+                    local vehicleEntry = {
+                        id = vehicle.id,
+                        label = vehicle.label,
+                        model = vehicle.model,
+                        image = vehicle.image,
+                        spawnLimit = vehicle.spawnLimit or 0,
+                        cooldown = vehicle.cooldown or 0,
+                        livery = vehicle.livery or 0,
+                        extras = vehicle.extras or {},
+                        extrasOff = vehicle.extrasOff or {},
+                        modifiers = vehicle.modifiers or {},
+                        platePrefix = vehicle.platePrefix or 'VMS',
+                        maxInventorySlots = vehicle.maxInventorySlots or 4
+                    }
+
+                    table.insert(currentDept.subDepartments, {
+                        id = 'default',
+                        label = 'Vehicles',
+                        image = department.image,
+                        vehicles = { vehicleEntry }
+                    })
+                end
+            end
+
+            if #currentDept.subDepartments > 0 then
+                table.insert(result, currentDept)
+            end
         end
-
-        table.insert(result, currentDept)
     end
 
     return result
 end
 
-local function spawnVehicleForPlayer(src, departmentKey, vehicleId)
+local function spawnVehicleForPlayer(src, departmentKey, subDeptKey, vehicleId)
     local department = Config.departments[departmentKey]
     if not department then
         TriggerClientEvent('c7vms2:notify', src, Config.lang.invalidDepartment)
         return
     end
 
-    if not hasDepartmentAccess(src, departmentKey) then
+    if not hasDepartmentAccess(src, department.ace, department.discordRoles) then
+        TriggerClientEvent('c7vms2:notify', src, Config.lang.noAccess)
+        return
+    end
+
+    local subDept = department.subDepartments and department.subDepartments[subDeptKey]
+    if not subDept then
+        TriggerClientEvent('c7vms2:notify', src, Config.lang.invalidDepartment)
+        return
+    end
+
+    if not hasDepartmentAccess(src, subDept.ace, subDept.discordRoles or {}) then
         TriggerClientEvent('c7vms2:notify', src, Config.lang.noAccess)
         return
     end
 
     local selectedVehicle = nil
-    for _, vehicle in ipairs(department.vehicles) do
+    for _, vehicle in ipairs(subDept.vehicles or {}) do
         if vehicle.id == vehicleId then
             selectedVehicle = vehicle
             break
@@ -255,7 +345,9 @@ local function spawnVehicleForPlayer(src, departmentKey, vehicleId)
 
     SetEntityHeading(vehicle, coords.w or 0.0)
     SetVehicleOnGroundProperly(vehicle)
-    SetVehicleNumberPlateText(vehicle, generatePlate(src, selectedVehicle.platePrefix or 'VMS'))
+
+    local plate = generatePlate(src, selectedVehicle.platePrefix or 'VMS')
+    SetVehicleNumberPlateText(vehicle, plate)
     SetVehicleEngineOn(vehicle, true, true, true)
     SetVehicleDirtLevel(vehicle, 0.0)
 
@@ -268,24 +360,151 @@ local function spawnVehicleForPlayer(src, departmentKey, vehicleId)
 
     SetPedIntoVehicle(ped, vehicle, -1)
 
+    local vehicleData = {
+        plate = plate,
+        status = Config.vehicleStatus.available,
+        reason = nil,
+        department = departmentKey,
+        subDepartment = subDeptKey,
+        assignedTo = getPlayerSteam(src),
+        spawnedAt = os.time(),
+        model = model,
+        label = selectedVehicle.label
+    }
+
+    vehicleFleet[plate] = vehicleData
+    vehicleOwnership[vehicle] = plate
+    saveVehicleState(plate, vehicleData)
+
     addSpawnCount(src)
     setCooldown(src, selectedVehicle.cooldown or 0)
 
     TriggerClientEvent('c7vms2:notify', src, Config.lang.spawned)
 end
 
+local function deleteNearestVehicle(src)
+    if not isAdmin(src) then
+        TriggerClientEvent('c7vms2:notify', src, Config.lang.notAdmin)
+        return
+    end
+
+    local ped = GetPlayerPed(src)
+    local coords = GetEntityCoords(ped)
+    local closestVehicle = nil
+    local closestDistance = 10.0
+
+    for vehicle, plate in pairs(vehicleOwnership) do
+        if DoesEntityExist(vehicle) then
+            local vehicleCoords = GetEntityCoords(vehicle)
+            local distance = #(coords - vehicleCoords)
+
+            if distance < closestDistance then
+                closestDistance = distance
+                closestVehicle = vehicle
+            end
+        end
+    end
+
+    if closestVehicle then
+        local plate = vehicleOwnership[closestVehicle]
+        deleteVehicleState(plate)
+        vehicleFleet[plate] = nil
+        vehicleOwnership[closestVehicle] = nil
+        DeleteEntity(closestVehicle)
+        TriggerClientEvent('c7vms2:notify', src, Config.lang.vehicleDeleted)
+    else
+        TriggerClientEvent('c7vms2:notify', src, 'No vehicle found nearby.')
+    end
+end
+
+local function setVehicleStatus(src, plate, status, reason)
+    local currentVehicle = vehicleFleet[plate]
+
+    if not currentVehicle then
+        TriggerClientEvent('c7vms2:notify', src, Config.lang.vehicleNotFound)
+        return
+    end
+
+    if not (isAdmin(src) or isSupervisor(src, currentVehicle.department)) then
+        TriggerClientEvent('c7vms2:notify', src, Config.lang.notAdmin)
+        return
+    end
+
+    currentVehicle.status = status
+    currentVehicle.reason = reason
+    currentVehicle.updatedBy = getPlayerSteam(src)
+    currentVehicle.updatedAt = os.time()
+
+    saveVehicleState(plate, currentVehicle)
+    TriggerClientEvent('c7vms2:notify', src, Config.lang.reasonUpdated)
+end
+
+local function getFleetStatus()
+    local fleetData = {}
+
+    for plate, data in pairs(vehicleFleet) do
+        table.insert(fleetData, {
+            plate = plate,
+            status = data.status,
+            reason = data.reason,
+            department = data.department,
+            subDepartment = data.subDepartment,
+            label = data.label,
+            model = data.model,
+            assignedTo = data.assignedTo,
+            spawnedAt = data.spawnedAt
+        })
+    end
+
+    return fleetData
+end
+
 RegisterNetEvent('c7vms2:getVehicleData', function()
-    TriggerClientEvent('c7vms2:receiveVehicleData', source, getVehicleList())
+    local vehicleData = getVehicleListForPlayer(source)
+    TriggerClientEvent('c7vms2:receiveVehicleData', source, vehicleData)
 end)
 
-RegisterNetEvent('c7vms2:requestSpawnVehicle', function(departmentKey, vehicleId)
-    spawnVehicleForPlayer(source, departmentKey, vehicleId)
+RegisterNetEvent('c7vms2:requestSpawnVehicle', function(departmentKey, subDeptKey, vehicleId)
+    spawnVehicleForPlayer(source, departmentKey, subDeptKey, vehicleId)
+end)
+
+RegisterNetEvent('c7vms2:setVehicleStatus', function(plate, status, reason)
+    setVehicleStatus(source, plate, status, reason)
+end)
+
+RegisterNetEvent('c7vms2:getFleetStatus', function()
+    local fleetData = getFleetStatus()
+    TriggerClientEvent('c7vms2:receiveFleetStatus', source, fleetData)
 end)
 
 RegisterCommand(Config.command, function(source)
     if source > 0 then
-        TriggerClientEvent('c7vms2:receiveVehicleData', source, getVehicleList())
+        local vehicleData = getVehicleListForPlayer(source)
+        TriggerClientEvent('c7vms2:receiveVehicleData', source, vehicleData)
     end
 end, false)
 
-print('[C7VMS2] Standalone VMS2 loaded successfully.')
+RegisterCommand(Config.adminCommand, function(source)
+    if source > 0 and isAdmin(source) then
+        local fleetData = getFleetStatus()
+        TriggerClientEvent('c7vms2:openAdminMenu', source, fleetData)
+    else
+        TriggerClientEvent('c7vms2:notify', source, Config.lang.notAdmin)
+    end
+end, false)
+
+RegisterCommand('vms2delete', function(source)
+    if source > 0 then
+        deleteNearestVehicle(source)
+    end
+end, false)
+
+AddEventHandler('playerDropped', function(reason)
+    local key = getPlayerKey(source)
+    if key then
+        playerCooldowns[key] = nil
+        playerSpawnCounts[key] = nil
+    end
+end)
+
+print('^2[C7VMS2 Premium]^7 Server loaded with fleet management and sub-departments.')
